@@ -1,5 +1,6 @@
 ---
 - name: A Playbook to Upgrade Resilient (SOAR) Instances
+    trdt:
   hosts: "{{ ansible_limit | default(omit) }}"
   become: true
   force_handlers: true
