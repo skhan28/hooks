@@ -1,0 +1,215 @@
+---
+- name: A Playbook to Upgrade Resilient (SOAR) Instances
+  hosts: "{{ ansible_limit | default(omit) }}"
+  become: true
+  force_handlers: true
+  pre_tasks:
+    - name: Check version string passed from command line
+      ansible.builtin.assert:
+        that:
+          - res_version|default(None)
+        quiet: true
+        fail_msg: Please pass version string with '-e res_version=<version>'
+      tags:
+        - always
+  vars:
+    repo_path: "/repository/resilient"
+    save_dir: "/root"
+    app_runfile: "soar-{{ res_version }}.run"
+
+  handlers:
+    # Currently handlers cannot import/include other roles or tasks cleanly
+    # so we'll roll our own here
+    - name: Clean up -- remove downloaded files
+      ansible.builtin.file:
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ save_dir }}/{{ app_runfile }}"
+      listen: "clean up"
+
+    - name: Reboot host and wait for it to restart
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by Ansible"
+        connect_timeout: 5
+        reboot_timeout: 300
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+        # test_command: uptime
+        # boot_time_command: uname -a
+      listen: "reboot host"
+
+  tasks:
+    - name: Apply latest Yum patches
+      ansible.builtin.yum:
+        name: '*'
+        state: latest
+        exclude: postgres*,pg*,
+
+    - name: Get Stanza Name
+      ansible.builtin.command: hostname -s
+      register: echo_stanza
+
+    - name: Include resilient role and get_version
+      ansible.builtin.include_role:
+        name: resilient
+        tasks_from: get_version
+
+    - name: Skip upgrade if current version matches upgrading version
+      when: current_res_version == res_version
+      block:
+        - name: Print out message if the host is already at the upgrading version
+          ansible.builtin.debug:
+            msg: Already at {{ res_version }}, skipping {{ inventory_hostname }}
+        - name: End upgrade if already at {{ res_version }}
+          ansible.builtin.meta: end_host
+
+    - name: Create logs folder if not exist already
+      delegate_to: localhost
+      run_once: true
+      become: false
+      ansible.builtin.file:
+        path: "logs"
+        state: directory
+        mode: 0774
+        group: devops
+      tags: local_logs
+
+    - name: Include saas_s3 role and download_from_s3
+      ansible.builtin.include_role:
+        name: saas_s3
+        tasks_from: download_from_s3
+      vars:
+        ansible_python_interpreter: /bin/python3
+        s3_endpoint: "https://s3.private.eu-de.cloud-object-storage.appdomain.cloud"
+        s3_bucket: "ibmresilient-saas-debug-staging-eu-de"
+        remote_dir: "{{ repo_path }}"
+        filelist:
+          - "{{ app_runfile }}"
+
+    - name: Include resilient role and stop services
+      ansible.builtin.include_role:
+        name: resilient
+        tasks_from: stop_services
+
+    - name: Start the upgrade
+      when: download_from_s3_result is succeeded
+      block:
+        - name: Start upgrade
+#          command: env RES_VERBOSE_MODE=1 SKIP_DB_BACKUP_IMPROVEMENT=1 sh -x {{ save_dir }}/{{ app_runfile }} 2>&1
+          ansible.builtin.shell: env soarStanza={{ echo_stanza.stdout }} RES_VERBOSE_MODE=1 SKIP_DB_BACKUP_IMPROVEMENT=1 sh -x {{ save_dir }}/{{ app_runfile }} 2>&1
+          register: upgrade_result
+          failed_when: upgrade_result is not succeeded or upgrade_result.stdout | regex_search('Failed to upgrade IBM Security SOAR')
+        - name: Copy run file output to logs folder
+          delegate_to: localhost
+          become: false
+          ansible.builtin.copy:
+            content: "{{ upgrade_result.stdout }}"
+            dest: "logs/upgrade-{{ res_version }}-{{ inventory_hostname }}.log"
+            mode: 0644
+      rescue:
+        - name: Copy run file output to logs folder
+          delegate_to: localhost
+          become: false
+          ansible.builtin.copy:
+            content: "{{ upgrade_result.stdout }}"
+            dest: "logs/upgrade-{{ res_version }}-{{ inventory_hostname }}.log"
+            mode: 0644
+            group: devops
+          notify: "clean up"
+        - name: Fail with a verbose message
+          ansible.builtin.fail:
+            msg: Installation Run file failed to execute
+
+        - name: Send upgrade fail message to Slack
+          community.general.slack:
+            token: "{{ lookup('ansible.builtin.env', 'SLACK_TOKEN', default=Undefined) }}"
+            channel: '#qtest'
+            color: 'danger'
+            # msg: 'Logs for {{ inventory_hostname }}: {{ script_op.stdout }}'
+            msg: |
+              SOAR upgrade failed...
+              ------------------------------------
+              `Host`: {{ ansible_host }}
+              `OS`: {{ ansible_distribution }} {{ ansible_distribution_version }}
+              `Kernel`: {{ ansible_kernel }}
+              `Status`: Installation Run file failed to execute
+              ------------------------------------
+          no_log: true
+          tags: slack_failed
+      tags:
+        - do_upgrade
+
+    - name: Include resilient role and start services
+      ansible.builtin.include_role:
+        name: resilient
+        tasks_from: start_services
+    - name: Include resilient role and get version
+      ansible.builtin.include_role:
+        name: resilient
+        tasks_from: get_version
+      tags:
+        - do_upgrade
+    - name: Post-upgrade check
+      block:
+        - name: Verify upgrade
+          ansible.builtin.assert:
+            quiet: true
+            that:
+              # return code is useless once installation run file gets to postinstall
+              # Instead, we have to search for a certain string, because first world problems
+              - start_services_result is succeeded
+              - current_res_version == res_version
+          changed_when: true
+          notify:
+            - "clean up"
+            - "reboot host"
+
+        - name: Flush handlers
+          ansible.builtin.meta: flush_handlers
+
+      rescue:
+        - name: Verify failed, clean up
+          ansible.builtin.assert:
+            quiet: true
+            that:
+              - true
+          changed_when: true
+          notify: "clean up"
+        - name: Fail with a verbose message
+          ansible.builtin.fail:
+            msg: Upgrade verification failed
+      tags:
+        - do_upgrade
+
+    - name: Start resilient services after reboot
+      ansible.builtin.include_role:
+        name: resilient
+        tasks_from: start_services
+
+    - name: Move cronjob back after upgrade
+      ansible.builtin.command: mv /root/101-saasbackup /etc/cron.d
+      ignore_errors: true # in case the cronjob is not present in /root
+
+    - name: Get current kernel release
+      ansible.builtin.command: uname -r
+      register: current_kernel
+      tags: slack_success
+
+    - name: Send upgrade success message to Slack
+      community.general.slack:
+        token: "{{ lookup('ansible.builtin.env', 'SLACK_TOKEN', default=Undefined) }}"
+        channel: '#qtest'
+        color: 'good'
+        # msg: 'Logs for {{ inventory_hostname }}: {{ script_op.stdout }}'
+        msg: |
+          SOAR upgrade completed...
+          ------------------------------------
+          `Host`: {{ ansible_host }}
+          `OS`: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          `Previous kernel`: {{ ansible_kernel }}
+          `Current kernel`: {{ current_kernel.stdout }}
+          `Status`: The host has been upgraded to SOAR version v{{ res_version }}
+          ------------------------------------
+      no_log: true
+      tags: slack_success
